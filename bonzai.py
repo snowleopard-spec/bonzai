@@ -32,6 +32,7 @@ APP_ROOTS = ["/root", "/home", "/opt", "/srv", "/var/www"]
 SUMMARIZE = {"node_modules", "__pycache__", "venv", "snap"}
 
 APP_TREE_DEPTH = 4
+MAX_ENTRIES_PER_DIR = 100  # dirs with more children than this get summarized
 
 IS_ROOT = (getattr(os, "geteuid", lambda: 1)() == 0)
 SUDO = [] if IS_ROOT else (["sudo", "-n"] if shutil.which("sudo") else [])
@@ -94,6 +95,13 @@ def dir_stats(path):
     return files, total
 
 
+def child_count(path):
+    try:
+        return sum(1 for _ in os.scandir(path))
+    except OSError:
+        return 0
+
+
 def render_tree(root, max_depth=APP_TREE_DEPTH):
     """ASCII tree of `root`, capped at `max_depth`. Hidden dirs and dirs in
     SUMMARIZE are replaced by a one-line `name/ (N files, SIZE)` summary.
@@ -125,7 +133,12 @@ def render_tree(root, max_depth=APP_TREE_DEPTH):
         for i, (e, is_dir) in enumerate(visible):
             last = (i == len(visible) - 1)
             connector = "└── " if last else "├── "
-            if is_dir and (e.name.startswith(".") or e.name in SUMMARIZE):
+            summarize_dir = is_dir and (
+                e.name.startswith(".")
+                or e.name in SUMMARIZE
+                or child_count(e.path) > MAX_ENTRIES_PER_DIR
+            )
+            if summarize_dir:
                 n, sz = dir_stats(e.path)
                 lines.append(f"{prefix}{connector}{e.name}/  ({n:,} files, {human(sz)})")
                 continue
