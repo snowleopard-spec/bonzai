@@ -1,45 +1,40 @@
 #!/usr/bin/env python3
 """
-droplet-report.py — run this ON the droplet (after you SSH in).
+bonzai.py — run this ON the droplet (after you SSH in).
 
 Produces a single markdown file describing the box:
-  1. Filesystem / folder structure
+  1. Application roots (project layout at /root, /home, /opt, /srv, /var/www)
   2. Storage & memory (free vs used)
   3. Installed packages
 
 Usage:
-  python3 droplet-report.py                 # writes to the current directory
-  python3 droplet-report.py /tmp            # writes to /tmp
-  python3 droplet-report.py --depth 4       # deeper whole-system tree (default 3)
-  python3 droplet-report.py --full          # exhaustive tree of / (big!)
-
-  DEPTH and FULL environment variables are also honoured, e.g. DEPTH=4 FULL=1.
+  python3 bonzai.py            # writes report to the current directory
+  python3 bonzai.py /tmp       # writes report to /tmp
 
 Notes:
   - Read-only. Run as root (or a sudo user) for the complete picture; as a
-    plain user it silently skips paths it can't read, giving a thinner tree.
-  - The whole-system tree is pruned (pseudo-filesystems + noise dirs) and
-    depth-limited so the output stays feedable to an LLM. The app roots are
-    shown in full depth. Use --full to override (can be very large).
+    plain user it silently skips paths it can't read.
+  - Application-root trees are capped at depth 4. Cache/venv/hidden dirs are
+    summarized as one line with file count + size, not listed out.
   - Stdlib only. No third-party packages, no `tree` binary required.
 """
 
 import os
-import sys
 import shutil
 import argparse
 import subprocess
 from datetime import datetime, timezone
 
 APP_ROOTS = ["/root", "/home", "/opt", "/srv", "/var/www"]
-NOISE = {"node_modules", "__pycache__", ".git", ".venv", "venv",
-         ".cache", "snap", ".mypy_cache", ".pytest_cache"}
-PSEUDO_FS = {"proc", "sys", "dev", "run"}
+
+# Dirs to summarize as "name/ (N files, SIZE)" instead of listing contents.
+# Hidden entries (name starts with '.') get the same treatment automatically.
+SUMMARIZE = {"node_modules", "__pycache__", "venv", "snap"}
+
+APP_TREE_DEPTH = 4
 
 IS_ROOT = (getattr(os, "geteuid", lambda: 1)() == 0)
 SUDO = [] if IS_ROOT else (["sudo", "-n"] if shutil.which("sudo") else [])
-
-sys.setrecursionlimit(20000)  # deep trees (e.g. --full over /usr)
 
 
 # --------------------------------------------------------------------------- #
@@ -86,14 +81,28 @@ def block(text):
 # --------------------------------------------------------------------------- #
 # filesystem tree (native, no `tree` binary needed)
 # --------------------------------------------------------------------------- #
-def render_tree(root, max_depth=None, exclude=frozenset()):
-    """Return an ASCII tree of `root`, excluding any entry whose basename is in
-    `exclude`, limited to `max_depth` levels below root (None = unlimited)."""
+def dir_stats(path):
+    files = 0
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path, onerror=lambda e: None):
+        for f in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, f)).st_size
+                files += 1
+            except OSError:
+                pass
+    return files, total
+
+
+def render_tree(root, max_depth=APP_TREE_DEPTH):
+    """ASCII tree of `root`, capped at `max_depth`. Hidden dirs and dirs in
+    SUMMARIZE are replaced by a one-line `name/ (N files, SIZE)` summary.
+    Hidden files are omitted entirely."""
     root = os.path.abspath(root)
     lines = [root]
 
     def walk(path, prefix, depth):
-        if max_depth is not None and depth >= max_depth:
+        if depth >= max_depth:
             return
         try:
             entries = sorted(os.scandir(path), key=lambda e: e.name)
@@ -102,14 +111,24 @@ def render_tree(root, max_depth=None, exclude=frozenset()):
             return
         except OSError:
             return
-        entries = [e for e in entries if e.name not in exclude]
-        for i, e in enumerate(entries):
-            last = (i == len(entries) - 1)
-            connector = "└── " if last else "├── "
+
+        visible = []
+        for e in entries:
             try:
                 is_dir = e.is_dir(follow_symlinks=False)
             except OSError:
                 is_dir = False
+            if not is_dir and e.name.startswith("."):
+                continue
+            visible.append((e, is_dir))
+
+        for i, (e, is_dir) in enumerate(visible):
+            last = (i == len(visible) - 1)
+            connector = "└── " if last else "├── "
+            if is_dir and (e.name.startswith(".") or e.name in SUMMARIZE):
+                n, sz = dir_stats(e.path)
+                lines.append(f"{prefix}{connector}{e.name}/  ({n:,} files, {human(sz)})")
+                continue
             name = e.name + ("/" if is_dir else "")
             lines.append(prefix + connector + name)
             if is_dir:
@@ -120,6 +139,8 @@ def render_tree(root, max_depth=None, exclude=frozenset()):
 
 
 def find_venvs(roots, max_depth=6):
+    skip = {"node_modules", "__pycache__", ".git", ".cache",
+            ".mypy_cache", ".pytest_cache", "snap"}
     venvs = set()
     for r in roots:
         if not os.path.isdir(r):
@@ -134,7 +155,7 @@ def find_venvs(roots, max_depth=6):
                 venvs.add(os.path.dirname(dirpath))
                 dirnames[:] = []          # don't descend into the venv
                 continue
-            dirnames[:] = [d for d in dirnames if d not in NOISE]
+            dirnames[:] = [d for d in dirnames if d not in skip]
     return sorted(venvs)
 
 
@@ -157,23 +178,13 @@ def largest_dirs(roots, n=20):
 # --------------------------------------------------------------------------- #
 # report sections
 # --------------------------------------------------------------------------- #
-def section_filesystem(depth, full):
-    out = [h("1. Filesystem structure")]
-
-    if full:
-        out.append(s("Whole-system tree (full)"))
-        out.append(block(render_tree("/", max_depth=None, exclude=PSEUDO_FS)))
-    else:
-        out.append(s(f"Whole-system map (depth {depth})"))
-        out.append(block(render_tree("/", max_depth=depth,
-                                      exclude=PSEUDO_FS | NOISE)))
-
-    out.append(s("Application roots (full depth)"))
+def section_filesystem():
+    out = [h(f"1. Application roots (depth {APP_TREE_DEPTH})")]
     for r in APP_ROOTS:
         if not os.path.isdir(r):
             continue
         out.append(f"\n**{r}**\n")
-        out.append(block(render_tree(r, max_depth=None, exclude=NOISE)))
+        out.append(block(render_tree(r)))
     return "\n".join(out)
 
 
@@ -238,12 +249,6 @@ def main():
     ap = argparse.ArgumentParser(description="Generate a markdown report of this host.")
     ap.add_argument("outdir", nargs="?", default=os.getcwd(),
                     help="directory to write the report into (default: cwd)")
-    ap.add_argument("--depth", type=int,
-                    default=int(os.environ.get("DEPTH", "3")),
-                    help="depth of the whole-system tree map (default 3)")
-    ap.add_argument("--full", action="store_true",
-                    default=os.environ.get("FULL", "0") == "1",
-                    help="exhaustive tree of / (can be very large)")
     args = ap.parse_args()
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -255,11 +260,11 @@ def main():
 
     parts = [
         f"# Droplet report — {hostname} — {now_utc}\n",
-        "> Read-only snapshot of filesystem, storage, and installed packages.",
-        section_filesystem(args.depth, args.full),
+        "> Read-only snapshot of app roots, storage, and installed packages.",
+        section_filesystem(),
         section_storage(),
         section_packages(),
-        "\n---\n_Generated by droplet-report.py_",
+        "\n---\n_Generated by bonzai.py_",
     ]
 
     with open(outpath, "w", encoding="utf-8") as f:
