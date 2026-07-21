@@ -6,6 +6,7 @@ Produces a single markdown file describing the box:
   1. Application roots (project layout at /root, /home, /opt, /srv, /var/www)
   2. Storage & memory (free vs used)
   3. Installed packages
+  4. Scheduled tasks (cron + systemd timers, schedules only)
 
 Usage:
   python3 bonzai.py            # writes report to the current directory
@@ -189,6 +190,62 @@ def largest_dirs(roots, n=20):
 
 
 # --------------------------------------------------------------------------- #
+# cron parsing (schedules only — command args stripped to avoid leaking secrets)
+# --------------------------------------------------------------------------- #
+def _read_maybe_sudo(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except PermissionError:
+        return run(["cat", path], use_sudo=True)
+    except OSError as e:
+        return f"(cannot read {path}: {e})"
+
+
+def _cron_lines(text, has_user_field):
+    """Yield (schedule, user_or_None, command_head) from crontab text.
+    Skips env-var lines, comments, and blanks. `command_head` is the first
+    whitespace-separated token of the command — all arguments stripped."""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        first = line[0]
+        if not (first.isdigit() or first in "*@"):
+            # env line like PATH=..., MAILTO=..., SHELL=...
+            continue
+
+        if first == "@":
+            expected = 3 if has_user_field else 2
+            parts = line.split(None, expected - 1)
+            if len(parts) < expected:
+                continue
+            schedule = parts[0]
+            user = parts[1] if has_user_field else None
+            cmd = parts[-1]
+        else:
+            expected = 7 if has_user_field else 6
+            parts = line.split(None, expected - 1)
+            if len(parts) < expected:
+                continue
+            schedule = " ".join(parts[:5])
+            user = parts[5] if has_user_field else None
+            cmd = parts[-1]
+
+        head = cmd.split(None, 1)[0] if cmd.split() else "(empty)"
+        yield schedule, user, head
+
+
+def _fmt_cron_rows(rows, has_user_field):
+    if not rows:
+        return "(no scheduled entries)"
+    if has_user_field:
+        return "\n".join(f"{sched:<15}  {user:<10}  {cmd}"
+                         for sched, user, cmd in rows)
+    return "\n".join(f"{sched:<15}  {cmd}" for sched, _u, cmd in rows)
+
+
+# --------------------------------------------------------------------------- #
 # report sections
 # --------------------------------------------------------------------------- #
 def section_filesystem():
@@ -255,6 +312,75 @@ def section_packages():
     return "\n".join(out)
 
 
+def section_cron():
+    out = [h("4. Scheduled tasks")]
+    out.append("> Schedules only; command arguments stripped to avoid leaking "
+               "secrets that may be embedded in cron lines.\n")
+
+    if os.path.exists("/etc/crontab"):
+        out.append(s("/etc/crontab"))
+        rows = list(_cron_lines(_read_maybe_sudo("/etc/crontab"),
+                                has_user_field=True))
+        out.append(block(_fmt_cron_rows(rows, has_user_field=True)))
+
+    cron_d = "/etc/cron.d"
+    if os.path.isdir(cron_d):
+        out.append(s("/etc/cron.d/"))
+        try:
+            files = sorted(f for f in os.listdir(cron_d)
+                           if os.path.isfile(os.path.join(cron_d, f)))
+        except OSError:
+            files = []
+        if not files:
+            out.append(block("(empty)"))
+        for fname in files:
+            rows = list(_cron_lines(_read_maybe_sudo(os.path.join(cron_d, fname)),
+                                    has_user_field=True))
+            out.append(f"\n**{fname}**\n")
+            out.append(block(_fmt_cron_rows(rows, has_user_field=True)))
+
+    for interval in ("hourly", "daily", "weekly", "monthly"):
+        d = f"/etc/cron.{interval}"
+        if not os.path.isdir(d):
+            continue
+        out.append(s(f"/etc/cron.{interval}/"))
+        try:
+            files = sorted(f for f in os.listdir(d) if not f.startswith("."))
+        except OSError:
+            files = []
+        listing = "\n".join(f"@{interval:<8}  {f}" for f in files) or "(empty)"
+        out.append(block(listing))
+
+    for spool in ("/var/spool/cron/crontabs", "/var/spool/cron"):
+        if not os.path.isdir(spool):
+            continue
+        out.append(s(f"{spool}/ (per-user crontabs)"))
+        try:
+            files = sorted(os.listdir(spool))
+        except (OSError, PermissionError):
+            ls_out = run(["ls", "-1", spool], use_sudo=True)
+            files = [] if ls_out.startswith("(") else ls_out.splitlines()
+        if not files:
+            out.append(block("(none / not readable)"))
+            break
+        for fname in files:
+            text = _read_maybe_sudo(os.path.join(spool, fname))
+            if text.startswith("("):
+                out.append(f"\n**user: {fname}**\n")
+                out.append(block(text))
+                continue
+            rows = list(_cron_lines(text, has_user_field=False))
+            out.append(f"\n**user: {fname}**\n")
+            out.append(block(_fmt_cron_rows(rows, has_user_field=False)))
+        break
+
+    if shutil.which("systemctl"):
+        out.append(s("systemd timers"))
+        out.append(block(run(["systemctl", "list-timers", "--all", "--no-pager"])))
+
+    return "\n".join(out)
+
+
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
@@ -273,10 +399,11 @@ def main():
 
     parts = [
         f"# Droplet report — {hostname} — {now_utc}\n",
-        "> Read-only snapshot of app roots, storage, and installed packages.",
+        "> Read-only snapshot of app roots, storage, installed packages, and scheduled tasks.",
         section_filesystem(),
         section_storage(),
         section_packages(),
+        section_cron(),
         "\n---\n_Generated by bonzai.py_",
     ]
 
