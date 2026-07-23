@@ -3,10 +3,13 @@
 bonzai.py — run this ON the droplet (after you SSH in).
 
 Produces a single markdown file describing the box:
-  1. Application roots (project layout at /root, /home, /opt, /srv, /var/www)
-  2. Storage & memory (free vs used)
-  3. Installed packages
-  4. Scheduled tasks (cron + systemd timers, schedules only)
+  1. Host (OS, kernel, CPU, RAM, uptime, IPs, timezone)
+  2. Application roots (project layout at /root, /home, /opt, /srv, /var/www)
+  3. Storage & memory (free vs used)
+  4. Installed packages
+  5. Scheduled tasks (cron + user-defined systemd timers)
+  6. Live services (running units + listening ports)
+  7. Web-server config (nginx sites-enabled, Caddyfile)
 
 Usage:
   python3 bonzai.py            # writes report to the current directory
@@ -17,10 +20,18 @@ Notes:
     plain user it silently skips paths it can't read.
   - Application-root trees are capped at depth 4. Cache/venv/hidden dirs are
     summarized as one line with file count + size, not listed out.
+  - Final markdown passes through a secret-redaction filter (Bearer tokens,
+    PEM blocks, AWS/GitHub/OpenAI/Anthropic/Slack keys, JWTs, URL creds,
+    env-var assignments to *_PASSWORD/*_SECRET/*_TOKEN/*_KEY). A count of
+    redactions appears in a banner at the top of the report if any fire.
   - Stdlib only. No third-party packages, no `tree` binary required.
 """
 
 import os
+import re
+import glob
+import gzip
+import shlex
 import shutil
 import argparse
 import subprocess
@@ -37,6 +48,61 @@ MAX_ENTRIES_PER_DIR = 100  # dirs with more children than this get summarized
 
 IS_ROOT = (getattr(os, "geteuid", lambda: 1)() == 0)
 SUDO = [] if IS_ROOT else (["sudo", "-n"] if shutil.which("sudo") else [])
+
+# Anchored patterns only (no long-random-string heuristics — those false-positive
+# on package hashes / version pins). Order matters: greedy multi-line first,
+# then prefix-anchored, then context-anchored.
+REDACTION_PATTERNS = [
+    ("pem-block",
+     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----"),
+     "<REDACTED-PEM-BLOCK>"),
+    ("aws-access-key-id",
+     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+     "<REDACTED-AWS-KEY-ID>"),
+    ("github-token",
+     re.compile(r"\b(?:ghp|gho|ghs|ghr|ghu)_[A-Za-z0-9_]{20,}\b"),
+     "<REDACTED-GH-TOKEN>"),
+    ("github-pat",
+     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{50,}\b"),
+     "<REDACTED-GH-PAT>"),
+    ("anthropic-key",
+     re.compile(r"\bsk-ant-[A-Za-z0-9_-]{40,}\b"),
+     "<REDACTED-ANTHROPIC-KEY>"),
+    ("openai-key",
+     re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{40,}\b"),
+     "<REDACTED-OPENAI-KEY>"),
+    ("slack-token",
+     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+     "<REDACTED-SLACK-TOKEN>"),
+    ("jwt",
+     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+     "<REDACTED-JWT>"),
+    ("bearer",
+     re.compile(r"(?i)(Bearer\s+)([A-Za-z0-9._~+/=-]{16,})"),
+     r"\1<REDACTED>"),
+    ("basic-auth",
+     re.compile(r"(?i)(Basic\s+)([A-Za-z0-9+/=]{12,})"),
+     r"\1<REDACTED>"),
+    ("url-credential",  # scheme://user:password@host
+     re.compile(r"(://[^:/@\s]+:)([^@\s]+)(@)"),
+     r"\1<REDACTED>\3"),
+    ("url-query-secret",  # ?token=... / ?api_key=... / etc.
+     re.compile(r"(?i)([?&](?:api[_-]?key|access[_-]?token|token|secret|password|passwd|pwd|auth)=)([^&\s\"']{6,})"),
+     r"\1<REDACTED>"),
+    ("env-assignment",  # PASSWORD=... / API_KEY=... / SECRET=... etc.
+     re.compile(r"(?im)^(\s*(?:export\s+)?\w*(?:PASSWORD|PASSWD|SECRET|TOKEN|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|AUTH)\s*=\s*)[\"']?([^\"'\n]{4,})[\"']?"),
+     r"\1<REDACTED>"),
+]
+
+
+def redact(text):
+    """Run all redaction patterns over `text`. Returns (new_text, counts_dict)."""
+    counts = {}
+    for name, pat, repl in REDACTION_PATTERNS:
+        text, n = pat.subn(repl, text)
+        if n:
+            counts[name] = n
+    return text, counts
 
 
 # --------------------------------------------------------------------------- #
@@ -190,7 +256,7 @@ def largest_dirs(roots, n=20):
 
 
 # --------------------------------------------------------------------------- #
-# cron parsing (schedules only — command args stripped to avoid leaking secrets)
+# cron file reading
 # --------------------------------------------------------------------------- #
 def _read_maybe_sudo(path):
     try:
@@ -202,64 +268,104 @@ def _read_maybe_sudo(path):
         return f"(cannot read {path}: {e})"
 
 
-def _cron_lines(text, has_user_field):
-    """Yield (schedule, user_or_None, command_head) from crontab text.
-    Skips env-var lines, comments, and blanks. `command_head` is the first
-    whitespace-separated token of the command — all arguments stripped."""
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        first = line[0]
-        if not (first.isdigit() or first in "*@"):
-            # env line like PATH=..., MAILTO=..., SHELL=...
-            continue
-
-        if first == "@":
-            expected = 3 if has_user_field else 2
-            parts = line.split(None, expected - 1)
-            if len(parts) < expected:
-                continue
-            schedule = parts[0]
-            user = parts[1] if has_user_field else None
-            cmd = parts[-1]
-        else:
-            expected = 7 if has_user_field else 6
-            parts = line.split(None, expected - 1)
-            if len(parts) < expected:
-                continue
-            schedule = " ".join(parts[:5])
-            user = parts[5] if has_user_field else None
-            cmd = parts[-1]
-
-        head = cmd.split(None, 1)[0] if cmd.split() else "(empty)"
-        yield schedule, user, head
-
-
-def _fmt_cron_rows(rows, has_user_field):
-    if not rows:
-        return "(no scheduled entries)"
-    if has_user_field:
-        return "\n".join(f"{sched:<15}  {user:<10}  {cmd}"
-                         for sched, user, cmd in rows)
-    return "\n".join(f"{sched:<15}  {cmd}" for sched, _u, cmd in rows)
-
-
 # --------------------------------------------------------------------------- #
 # report sections
 # --------------------------------------------------------------------------- #
+def _os_pretty_name():
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "(unknown)"
+
+
+def _cpu_info():
+    model = None
+    cores = 0
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name") and not model:
+                    model = line.split(":", 1)[1].strip()
+                elif line.startswith("processor"):
+                    cores += 1
+    except OSError:
+        pass
+    return model or "(unknown)", cores or "?"
+
+
+def _mem_total():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return f"{int(line.split()[1]) / 1024 / 1024:.1f} GiB"
+    except OSError:
+        pass
+    return "(unknown)"
+
+
+def _timezone():
+    try:
+        with open("/etc/timezone") as f:
+            tz = f.read().strip()
+            if tz:
+                return tz
+    except OSError:
+        pass
+    return run(["timedatectl", "show", "-p", "Timezone", "--value"]) or "(unknown)"
+
+
+def section_host():
+    hostname = run(["hostname"]) or "unknown"
+    model, cores = _cpu_info()
+    ips = run(["hostname", "-I"]) or "(unknown)"
+    lines = [
+        f"Host:     {hostname}",
+        f"OS:       {_os_pretty_name()}",
+        f"Kernel:   {run(['uname', '-sr'])}",
+        f"Arch:     {run(['uname', '-m'])}",
+        f"CPU:      {model}  ({cores} cores)",
+        f"Memory:   {_mem_total()}",
+        f"Uptime:   {run(['uptime', '-p'])}",
+        f"IPs:      {ips}",
+        f"Timezone: {_timezone()}",
+    ]
+    return h("1. Host") + "\n" + block("\n".join(lines))
+
+
+def _root_one_liner(root):
+    """If `root` is trivially empty or contains only the default nginx welcome
+    page, return a short summary. Otherwise return None (caller renders tree)."""
+    files, _ = dir_stats(root)
+    if files == 0:
+        return "(empty)"
+    if files == 1:
+        for _dp, _dn, fn in os.walk(root, onerror=lambda e: None):
+            if "index.nginx-debian.html" in fn:
+                return "(default nginx welcome page only)"
+    return None
+
+
 def section_filesystem():
-    out = [h(f"1. Application roots (depth {APP_TREE_DEPTH})")]
+    out = [h(f"2. Application roots (depth {APP_TREE_DEPTH})")]
     for r in APP_ROOTS:
         if not os.path.isdir(r):
             continue
-        out.append(f"\n**{r}**\n")
-        out.append(block(render_tree(r)))
+        summary = _root_one_liner(r)
+        if summary:
+            out.append(f"\n**{r}** — {summary}")
+        else:
+            out.append(f"\n**{r}**\n")
+            out.append(block(render_tree(r)))
     return "\n".join(out)
 
 
 def section_storage():
-    out = [h("2. Storage & memory")]
+    out = [h("3. Storage & memory")]
     out.append(s("Disk usage (free vs used per mount)"))
     out.append(block(run(["df", "-hT", "-x", "tmpfs", "-x", "devtmpfs"])))
     out.append(s("RAM & swap"))
@@ -269,16 +375,56 @@ def section_storage():
     return "\n".join(out)
 
 
-def section_packages():
-    out = [h("3. Installed packages")]
+def _apt_history_installs():
+    """Packages a human explicitly installed via `apt install ...`, parsed
+    from /var/log/apt/history.log*. Returns sorted list of names."""
+    pkgs = set()
+    for path in sorted(glob.glob("/var/log/apt/history.log*")):
+        try:
+            opener = gzip.open if path.endswith(".gz") else open
+            with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except (OSError, PermissionError):
+            continue
+        for line in text.splitlines():
+            if not line.startswith("Commandline: "):
+                continue
+            try:
+                tokens = shlex.split(line[len("Commandline: "):])
+            except ValueError:
+                tokens = line[len("Commandline: "):].split()
+            if not tokens:
+                continue
+            if os.path.basename(tokens[0]) not in ("apt", "apt-get", "aptitude"):
+                continue
+            try:
+                i = tokens.index("install")
+            except ValueError:
+                continue
+            for t in tokens[i + 1:]:
+                if t.startswith("-"):
+                    continue
+                # strip version pin (foo=1.2) or release suffix (foo/jammy)
+                name = t.split("=", 1)[0].split("/", 1)[0]
+                if name:
+                    pkgs.add(name)
+    return sorted(pkgs)
 
-    out.append(s("APT (manually installed)"))
-    if shutil.which("apt-mark"):
+
+def section_packages():
+    out = [h("4. Installed packages")]
+
+    out.append(s("APT (installed via `apt install`)"))
+    installs = _apt_history_installs()
+    total = run(["dpkg-query", "-f", ".", "-W"]) if shutil.which("dpkg-query") else ""
+    count = len(total) if total and not total.startswith("(") else "?"
+    if installs:
+        out.append(block("\n".join(installs) + f"\n\ntotal dpkg packages: {count}"))
+    elif shutil.which("apt-mark"):
+        # Fallback: history.log unavailable — use apt-mark showmanual
         manual = run(["apt-mark", "showmanual"])
         manual = "\n".join(sorted(manual.splitlines()))
-        total = run(["dpkg-query", "-f", ".", "-W"])
-        count = len(total) if total and not total.startswith("(") else "?"
-        out.append(block(f"{manual}\n\ntotal dpkg packages: {count}"))
+        out.append(block(f"(apt history unavailable; showing apt-mark showmanual)\n\n{manual}\n\ntotal dpkg packages: {count}"))
     else:
         out.append(block("(apt not present)"))
 
@@ -290,14 +436,6 @@ def section_packages():
         out.append(s("npm (global)"))
         out.append(block(run(["npm", "ls", "-g", "--depth=0"])))
 
-    out.append(s("Python (system pip)"))
-    if shutil.which("pip3"):
-        out.append(block(run(["pip3", "freeze"])))
-    elif shutil.which("pip"):
-        out.append(block(run(["pip", "freeze"])))
-    else:
-        out.append(block("(no system pip)"))
-
     out.append(s("Python virtualenvs"))
     venvs = find_venvs(["/root", "/home", "/opt", "/srv"])
     if not venvs:
@@ -306,50 +444,48 @@ def section_packages():
         py = os.path.join(v, "bin", "python")
         pip = os.path.join(v, "bin", "pip")
         ver = run([py, "--version"]) if os.path.exists(py) else "(no python)"
-        freeze = run([pip, "freeze"]) if os.path.exists(pip) else "(no pip)"
+        if os.path.exists(pip):
+            top = run([pip, "list", "--not-required", "--format=freeze"])
+        else:
+            top = "(no pip)"
         out.append(f"\n**{v}**\n")
-        out.append(block(f"{ver}\n--- pip freeze ---\n{freeze}"))
+        out.append(block(f"{ver}\n--- top-level packages ---\n{top}"))
     return "\n".join(out)
 
 
 def section_cron():
-    out = [h("4. Scheduled tasks")]
-    out.append("> Schedules only; command arguments stripped to avoid leaking "
-               "secrets that may be embedded in cron lines.\n")
+    out = [h("5. Scheduled tasks")]
 
     if os.path.exists("/etc/crontab"):
         out.append(s("/etc/crontab"))
-        rows = list(_cron_lines(_read_maybe_sudo("/etc/crontab"),
-                                has_user_field=True))
-        out.append(block(_fmt_cron_rows(rows, has_user_field=True)))
+        out.append(block(_read_maybe_sudo("/etc/crontab")))
 
     cron_d = "/etc/cron.d"
     if os.path.isdir(cron_d):
-        out.append(s("/etc/cron.d/"))
         try:
             files = sorted(f for f in os.listdir(cron_d)
-                           if os.path.isfile(os.path.join(cron_d, f)))
+                           if os.path.isfile(os.path.join(cron_d, f))
+                           and f != ".placeholder")
         except OSError:
             files = []
-        if not files:
-            out.append(block("(empty)"))
-        for fname in files:
-            rows = list(_cron_lines(_read_maybe_sudo(os.path.join(cron_d, fname)),
-                                    has_user_field=True))
-            out.append(f"\n**{fname}**\n")
-            out.append(block(_fmt_cron_rows(rows, has_user_field=True)))
+        if files:
+            out.append(s("/etc/cron.d/"))
+            for fname in files:
+                out.append(f"\n**{fname}**\n")
+                out.append(block(_read_maybe_sudo(os.path.join(cron_d, fname))))
 
     for interval in ("hourly", "daily", "weekly", "monthly"):
         d = f"/etc/cron.{interval}"
         if not os.path.isdir(d):
             continue
-        out.append(s(f"/etc/cron.{interval}/"))
         try:
             files = sorted(f for f in os.listdir(d) if not f.startswith("."))
         except OSError:
             files = []
-        listing = "\n".join(f"@{interval:<8}  {f}" for f in files) or "(empty)"
-        out.append(block(listing))
+        if not files:
+            continue
+        out.append(s(f"/etc/cron.{interval}/"))
+        out.append(block("\n".join(files)))
 
     for spool in ("/var/spool/cron/crontabs", "/var/spool/cron"):
         if not os.path.isdir(spool):
@@ -364,19 +500,77 @@ def section_cron():
             out.append(block("(none / not readable)"))
             break
         for fname in files:
-            text = _read_maybe_sudo(os.path.join(spool, fname))
-            if text.startswith("("):
-                out.append(f"\n**user: {fname}**\n")
-                out.append(block(text))
-                continue
-            rows = list(_cron_lines(text, has_user_field=False))
             out.append(f"\n**user: {fname}**\n")
-            out.append(block(_fmt_cron_rows(rows, has_user_field=False)))
+            out.append(block(_read_maybe_sudo(os.path.join(spool, fname))))
         break
 
+    user_timer_dir = "/etc/systemd/system"
+    try:
+        with os.scandir(user_timer_dir) as it:
+            user_timers = sorted(
+                e.name for e in it
+                if e.name.endswith(".timer") and e.is_file(follow_symlinks=False)
+            )
+    except OSError:
+        user_timers = []
+    if user_timers:
+        out.append(s("systemd timers (user-defined)"))
+        for tname in user_timers:
+            out.append(f"\n**{tname}**\n")
+            out.append(block(_read_maybe_sudo(os.path.join(user_timer_dir, tname))))
+
+    return "\n".join(out)
+
+
+def section_services():
+    out = [h("6. Live services")]
+
     if shutil.which("systemctl"):
-        out.append(s("systemd timers"))
-        out.append(block(run(["systemctl", "list-timers", "--all", "--no-pager"])))
+        out.append(s("Running services"))
+        out.append(block(run([
+            "systemctl", "list-units", "--type=service", "--state=running",
+            "--no-pager", "--no-legend", "--plain",
+        ])))
+
+    if shutil.which("ss"):
+        out.append(s("Listening ports (TCP/UDP)"))
+        out.append(block(run(["ss", "-tulnp"], use_sudo=True)))
+
+    return "\n".join(out)
+
+
+def section_webserver():
+    out = [h("7. Web-server config")]
+    nginx_installed = shutil.which("nginx") is not None
+    caddy_installed = shutil.which("caddy") is not None
+
+    if not (nginx_installed or caddy_installed):
+        out.append(block("(no web servers installed)"))
+        return "\n".join(out)
+
+    if nginx_installed:
+        out.append(s("nginx sites-enabled"))
+        sites = "/etc/nginx/sites-enabled"
+        if os.path.isdir(sites):
+            try:
+                files = sorted(os.listdir(sites))
+            except OSError:
+                files = []
+            if not files:
+                out.append(block("(no sites enabled)"))
+            for fname in files:
+                out.append(f"\n**{fname}**\n")
+                out.append(block(_read_maybe_sudo(os.path.join(sites, fname))))
+        else:
+            out.append(block(f"({sites} not present)"))
+
+    if caddy_installed:
+        out.append(s("Caddyfile"))
+        cf = "/etc/caddy/Caddyfile"
+        if os.path.exists(cf):
+            out.append(block(_read_maybe_sudo(cf)))
+        else:
+            out.append(block(f"({cf} not present)"))
 
     return "\n".join(out)
 
@@ -399,16 +593,31 @@ def main():
 
     parts = [
         f"# Droplet report — {hostname} — {now_utc}\n",
-        "> Read-only snapshot of app roots, storage, installed packages, and scheduled tasks.",
+        "> Read-only snapshot of host specs, filesystem, storage, packages, "
+        "scheduled tasks, live services, and web-server config.",
+        section_host(),
         section_filesystem(),
         section_storage(),
         section_packages(),
         section_cron(),
+        section_services(),
+        section_webserver(),
         "\n---\n_Generated by bonzai.py_",
     ]
 
+    report = "\n".join(parts) + "\n"
+    report, redactions = redact(report)
+    if redactions:
+        summary = ", ".join(f"{n}× {name}" for name, n in redactions.items())
+        banner = f"> [!] Secret redaction applied: {summary}\n\n"
+        report = report.replace(
+            "> Read-only snapshot",
+            banner + "> Read-only snapshot",
+            1,
+        )
+
     with open(outpath, "w", encoding="utf-8") as f:
-        f.write("\n".join(parts) + "\n")
+        f.write(report)
 
     print(f"Wrote: {outpath}")
 
