@@ -2,7 +2,7 @@
 # run.sh — run bonzai.py on the droplet and pull the report back locally.
 set -euo pipefail
 
-DROPLET="root@161.35.122.12"
+DROPLET="${BONZAI_SSH_HOST:-<droplet>}"
 REMOTE_DIR="/root/bonzai"
 REMOTE_OUT="/tmp"
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
